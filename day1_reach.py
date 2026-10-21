@@ -44,7 +44,7 @@ def main():
         tcp_pose = to_numpy(base.agent.tcp.pose.p)  # 末端执行器位置,世界坐标[x,y,z]，TCP 是夹爪的控制参考点，可以理解为两根夹指之间的一个点。
         cube_pose = to_numpy(base.cube.pose.p)  # 方块位置， 世界坐标
 
-        target_pose = target_pos = cube_pose + np.array([0.0, 0.0, height_offset], dtype=np.float32)
+        target_pose  = cube_pose + np.array([0.0, 0.0, height_offset], dtype=np.float32)
         # 设置目标点，目标点与方块的 x、y 坐标相同，z 坐标比方块中心高 12 cm。
 
         print("观测形状：", obs.shape)
