@@ -92,13 +92,7 @@ def main():
                     stage = "grasp"
                     continue
 
-                # 接近动作
-                move = np.clip(gain * erro,-max_action,max_action,)
-                action = np.array([move[0], move[1], move[2], gripper],dtype=np.float32,).reshape(env.action_space.shape)
-
-                obs, reward, terminated, truncated, info = env.step(action)
-                env.render()
-                time.sleep(0.05)
+                
 
                 if stage == "grasp":
                     print("夹爪闭合完成，开始抬起")
@@ -130,10 +124,18 @@ def main():
                         break
 
                     if hold_step >= 20:
-                        print(
-                            f"通过抓取练习检查：方块持续升高超过 5 cm，"
-                            f"当前升高 {height_increase:.3f} m")
+                        print(f"通过抓取检查：方块持续升高超过 5 cm，")
+
                         break
+
+
+                # 接近动作
+                move = np.clip(gain * erro,-max_action,max_action,)
+                action = np.array([move[0], move[1], move[2], gripper],dtype=np.float32,).reshape(env.action_space.shape)
+                
+                obs, reward, terminated, truncated, info = env.step(action)
+                env.render()
+                time.sleep(0.05)
 
                 if terminated.item() or truncated.item():
                     print(f"环境结束，当前阶段：{stage}")
