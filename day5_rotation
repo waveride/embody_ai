@@ -1,0 +1,290 @@
+import time
+
+import gymnasium as gym
+import mani_skill.envs
+import numpy as np
+import sapien
+import torch
+
+from scipy.spatial.transform import Rotation
+from mani_skill.envs.tasks.tabletop.pick_cube import PickCubeEnv
+from mani_skill.utils.building import actors
+from mani_skill.utils.registration import register_env
+from mani_skill.utils.scene_builder.table import TableSceneBuilder
+
+
+ANGLE_DEG = 30.0       # 修改为 0、30、60，观察夹爪朝向
+MAX_STEPS = 700
+POS_TOL = 0.005
+ROT_TOL = np.deg2rad(4)
+
+
+def to_numpy(tensor):
+    return tensor[0].detach().cpu().numpy().copy()
+
+
+def get_pose(pose):
+    """读取世界位置与旋转矩阵。"""
+    position = to_numpy(pose.p)
+
+    # ManiSkill: [w, x, y, z]
+    # SciPy:     [x, y, z, w]
+    q = to_numpy(pose.q)
+    rotation = Rotation.from_quat(q[[1, 2, 3, 0]]).as_matrix()
+
+    return position, rotation
+
+
+@register_env("LearnRotatedBox-v1", max_episode_steps=MAX_STEPS)
+class LearnRotatedBoxEnv(PickCubeEnv):
+    """复用 PickCube 的机器人和相机，替换桌面物体。"""
+
+    def _load_scene(self, options):
+        self.table_scene = TableSceneBuilder(
+            self,
+            robot_init_qpos_noise=self.robot_init_qpos_noise,
+        )
+        self.table_scene.build()
+
+        # 半尺寸：实际长 12 cm、宽 3 cm、高 4 cm
+        builder = self.scene.create_actor_builder()
+        half_size = [0.06, 0.015, 0.02]
+
+        builder.add_box_collision(half_size=half_size)
+        builder.add_box_visual(
+            half_size=half_size,
+            material=sapien.render.RenderMaterial(
+                base_color=[0.9, 0.25, 0.1, 1.0]
+            ),
+        )
+        builder.initial_pose = sapien.Pose(p=[0, 0, 0.02])
+
+        # 保留 cube 名称，兼容父类的观测代码
+        self.cube = builder.build(name="rotated_box")
+
+        self.goal_site = actors.build_sphere(
+            self.scene,
+            radius=0.015,
+            color=[0, 1, 0, 1],
+            name="goal_site",
+            body_type="kinematic",
+            add_collision=False,
+            initial_pose=sapien.Pose(p=[0, 0, 0.17]),
+        )
+        self._hidden_objects.append(self.goal_site)
+
+    def _initialize_episode(self, env_idx, options):
+        super()._initialize_episode(env_idx, options)
+
+        angle = np.deg2rad(ANGLE_DEG)
+
+        # 绕 z 轴旋转的四元数，顺序为 wxyz
+        q = [
+            np.cos(angle / 2),
+            0.0,
+            0.0,
+            np.sin(angle / 2),
+        ]
+
+        self.cube.set_pose(
+            sapien.Pose(p=[0.0, 0.0, 0.02], q=q)
+        )
+        self.goal_site.set_pose(
+            sapien.Pose(p=[0.0, 0.0, 0.17])
+        )
+
+    def evaluate(self):
+        grasped = self.agent.is_grasping(self.cube)
+        lifted = self.cube.pose.p[:, 2] > 0.12
+
+        return {
+            "success": grasped & lifted,
+            "is_grasped": grasped,
+        }
+
+
+def make_action(base, target_p, target_R, gripper):
+    """
+    世界目标位姿 → 小步目标 → 底座坐标系 → 控制动作。
+
+    限制每次目标变化，避免一次发送过大的位置或朝向变化。
+    """
+    current_p, current_R = get_pose(base.agent.tcp.pose)
+
+    # 1. 位置：每次最多给出 1 cm 的目标位移
+    position_error = target_p - current_p
+    distance = np.linalg.norm(position_error)
+
+    position_step = position_error * min(
+        1.0, 0.01 / max(distance, 1e-8)
+    )
+    command_p_world = current_p + position_step
+
+    # 2. 朝向：求当前朝向到目标朝向的相对旋转
+    relative_R = target_R @ current_R.T
+    rotation_error = Rotation.from_matrix(relative_R).as_rotvec()
+    angle = np.linalg.norm(rotation_error)
+
+    # 每次目标旋转最多约 4.6°
+    rotation_step = rotation_error * min(
+        1.0, 0.08 / max(angle, 1e-8)
+    )
+    command_R_world = (
+        Rotation.from_rotvec(rotation_step).as_matrix()
+        @ current_R
+    )
+
+    # 3. 世界坐标系 → 机器人底座坐标系
+    base_p, base_R = get_pose(base.agent.robot.pose)
+
+    command_p_base = base_R.T @ (command_p_world - base_p)
+    command_R_base = base_R.T @ command_R_world
+
+    # pd_ee_pose 使用 XYZ 欧拉角，单位为弧度
+    command_euler = Rotation.from_matrix(
+        command_R_base
+    ).as_euler("XYZ")
+
+    # 3 个位置量 + 3 个朝向量 + 1 个夹爪量
+    action = np.concatenate([
+        command_p_base,
+        command_euler,
+        [gripper],
+    ]).astype(np.float32)
+
+    return action
+
+
+def main():
+    env = gym.make(
+        "LearnRotatedBox-v1",
+        robot_uids="panda",
+        robot_init_qpos_noise=0.0,
+        num_envs=1,
+        sim_backend="cpu",
+        obs_mode="state",
+        control_mode="pd_ee_pose",
+        reward_mode="none",
+        render_mode="human",
+        max_episode_steps=MAX_STEPS,
+    )
+
+    try:
+        env.reset(seed=2)
+        base = env.unwrapped
+
+        # ---------- 重点一：读取物体世界位姿 ----------
+        object_p, object_R = get_pose(base.cube.pose)
+
+        # ---------- 重点二：计算世界目标位置 ----------
+        approach_local = np.array([0.0, 0.0, 0.12])
+
+        # 抓取点略高于中心，给手指留出桌面间隙
+        grasp_local = np.array([0.0, 0.0, 0.005])
+
+        approach_world = object_R @ approach_local + object_p
+        grasp_world = object_R @ grasp_local + object_p
+
+        # ---------- 重点三：计算世界目标朝向 ----------
+        # Panda TCP 的 z 轴为接近方向，y 轴为夹爪开合方向
+        # 令 z 朝下，y 沿物体短边，x 沿物体长边
+        grasp_rotation_local = np.diag([1.0, -1.0, -1.0])
+        grasp_rotation_world = object_R @ grasp_rotation_local
+
+        # 先在原位置调整朝向，再移动到物体上方
+        target_p, _ = get_pose(base.agent.tcp.pose)
+        target_R = grasp_rotation_world.copy()
+
+        stage = "align"
+        stage_steps = 0
+
+        print("物体旋转角度：", ANGLE_DEG)
+        print("接近位置：", approach_world)
+        print("抓取位置：", grasp_world)
+        print("夹爪目标朝向：\n", target_R)
+        print("开始：在空中调整夹爪朝向")
+
+        for step in range(MAX_STEPS):
+            gripper = -1.0 if stage in ("close", "lift") else 1.0
+
+            action = make_action(
+                base, target_p, target_R, gripper
+            ).reshape(env.action_space.shape)
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            env.render()
+            time.sleep(0.02)
+            stage_steps += 1
+
+            # 动作执行后，检查位置与朝向
+            tcp_p, tcp_R = get_pose(base.agent.tcp.pose)
+
+            position_error = np.linalg.norm(target_p - tcp_p)
+            angle_error = Rotation.from_matrix(
+                target_R @ tcp_R.T
+            ).magnitude()
+
+            reached = (
+                position_error < POS_TOL
+                and angle_error < ROT_TOL
+            )
+
+            if step % 20 == 0:
+                print(
+                    f"{stage:8s} | "
+                    f"位置误差 {position_error:.4f} m | "
+                    f"朝向误差 {np.rad2deg(angle_error):.2f}°"
+                )
+
+            # 本环境的成功条件：夹住长方体并抬高
+            if bool(info["success"].item()):
+                print("成功：长方体已抓住并抬起！")
+                break
+
+            next_stage = None
+
+            if stage == "align" and reached:
+                target_p = approach_world.copy()
+                next_stage = "approach"
+                print("朝向对齐，移动到物体上方")
+
+            elif stage == "approach" and reached:
+                target_p = grasp_world.copy()
+                next_stage = "descend"
+                print("到达上方，开始下降")
+
+            elif stage == "descend" and reached:
+                target_p = tcp_p.copy()
+                next_stage = "close"
+                print("到达抓取位置，闭合夹爪")
+
+            elif stage == "close" and stage_steps >= 25:
+                if not bool(info["is_grasped"].item()):
+                    print("未检测到可靠抓取，停止")
+                    break
+
+                target_p = tcp_p.copy()
+                target_p[2] += 0.15
+                next_stage = "lift"
+                print("检测到抓取，开始抬升")
+
+            if next_stage is not None:
+                stage = next_stage
+                stage_steps = 0
+
+            elif stage_steps >= 180:
+                print(f"阶段超时：{stage}")
+                break
+
+            if bool(terminated.item()) or bool(truncated.item()):
+                print("环境结束")
+                break
+
+        input("按 Enter 关闭窗口……")
+
+    finally:
+        env.close()
+
+
+if __name__ == "__main__":
+    main()
